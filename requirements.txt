@@ -1,0 +1,9 @@
+streamlit
+pandas
+matplotlib
+fpdf2
+openpyxl
+pdfplumber
+chardet
+pdf2image
+pytesseract
