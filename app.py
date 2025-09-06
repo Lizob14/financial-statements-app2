@@ -5,11 +5,12 @@ from fpdf import FPDF
 import tempfile
 import os
 from io import BytesIO
-import io
 import chardet
 import pdfplumber
 from pdf2image import convert_from_bytes
 import pytesseract
+import io
+import re
 
 # -------------------------
 # Page config
@@ -20,6 +21,48 @@ st.markdown("""
 Upload your bank statement (CSV, Excel, or PDF).  
 You'll get transactions, Income Statement, Balance Sheet, Ratios, charts, PDF & Excel export, and enterprise valuation (DCF, EV/EBITDA, Revenue multiple).
 """)
+
+# -------------------------
+# Smart PDF/OCR parser
+# -------------------------
+def parse_pdf_smart(file_bytes):
+    rows = []
+
+    # --- Try text extraction with pdfplumber ---
+    try:
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            for page in pdf.pages:
+                text = page.extract_text()
+                if text:
+                    for line in text.split("\n"):
+                        rows.append(line)
+    except:
+        pass
+
+    # --- Fallback to OCR for scanned PDFs ---
+    if not rows:
+        images = convert_from_bytes(file_bytes)
+        for image in images:
+            text = pytesseract.image_to_string(image)
+            rows.extend(text.split("\n"))
+
+    # --- Extract columns ---
+    data = []
+    date_regex = r"\d{2}[/-]\d{2}[/-]\d{2,4}|\d{4}[/-]\d{2}[/-]\d{2}"
+    amount_regex = r"-?\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?"
+
+    for row in rows:
+        date_match = re.search(date_regex, row)
+        amount_match = re.findall(amount_regex, row.replace(",", ""))
+        if date_match and amount_match:
+            date_val = date_match.group()
+            amount_val = float(amount_match[-1].replace(",", ""))
+            desc = row.replace(date_val, "").replace(str(amount_match[-1]), "").strip()
+            data.append([date_val, desc, amount_val])
+
+    df = pd.DataFrame(data, columns=["Date", "Description", "Amount"])
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce", dayfirst=True)
+    return df
 
 # -------------------------
 # File upload
@@ -45,35 +88,10 @@ if uploaded_file:
 
         # ---- PDF ----
         elif uploaded_file.name.endswith(".pdf"):
-            pages = []
-            try:
-                # First try table extraction (pdfplumber)
-                with pdfplumber.open(uploaded_file) as pdf:
-                    for page in pdf.pages:
-                        table = page.extract_table()
-                        if table:
-                            page_df = pd.DataFrame(table[1:], columns=table[0])
-                            pages.append(page_df)
-
-                # If pdfplumber fails (no tables), use OCR
-                if not pages:
-                    uploaded_file.seek(0)
-                    images = convert_from_bytes(uploaded_file.read())
-                    for image in images:
-                        text = pytesseract.image_to_string(image)
-                        rows = [line.split() for line in text.split("\n") if line.strip()]
-                        if len(rows) > 1:
-                            df_page = pd.DataFrame(rows[1:], columns=rows[0])
-                            pages.append(df_page)
-
-                if pages:
-                    df = pd.concat(pages, ignore_index=True)
-                else:
-                    st.error("PDF could not be parsed. Try exporting CSV/Excel from your bank.")
-                    st.stop()
-
-            except Exception as e:
-                st.error(f"Error reading PDF: {e}")
+            uploaded_file.seek(0)
+            df = parse_pdf_smart(uploaded_file.read())
+            if df.empty:
+                st.error("Could not parse any transactions from this PDF. Try exporting CSV/Excel instead.")
                 st.stop()
 
         else:
@@ -106,10 +124,22 @@ if uploaded_file:
 
     df.rename(columns=col_mapping, inplace=True)
 
-    required_cols = {"Date", "Description", "Amount"}
-    if not required_cols.issubset(df.columns):
-        st.error(f"File must have columns matching: {', '.join(required_cols)}")
+    # -------------------------
+    # Clean duplicate / empty columns
+    # -------------------------
+    df = df.dropna(axis=1, how='all')          # remove empty columns
+    df = df.loc[:, ~df.columns.duplicated()]   # remove duplicate columns
+    df.columns = df.columns.str.strip()        # trim spaces
+
+    if "Date" not in df.columns:
+        st.error("No valid 'Date' column detected. Please check your PDF/CSV.")
         st.stop()
+
+    if df["Date"].isnull().all():
+        st.error("All dates could not be parsed. Check your PDF or use CSV/Excel instead.")
+        st.stop()
+    if df["Date"].isnull().any():
+        st.warning(f"{df['Date'].isnull().sum()} rows could not be parsed into dates and will be ignored.")
 
     # -------------------------
     # Categorization
@@ -130,7 +160,6 @@ if uploaded_file:
 
     df["Amount"] = pd.to_numeric(df["Amount"], errors="coerce")
     df["Category"] = df.apply(lambda row: categorize(row["Description"], row["Amount"]), axis=1)
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
 
     st.subheader("📑 Transactions")
     st.dataframe(df, use_container_width=True)
