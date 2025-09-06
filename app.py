@@ -48,7 +48,11 @@ def parse_pdf_smart(file_bytes):
 
     # --- Extract columns ---
     data = []
-    date_regex = r"\d{2}[/-]\d{2}[/-]\d{2,4}|\d{4}[/-]\d{2}[/-]\d{2}"
+    date_regex = (
+        r"\d{2}[/-]\d{2}[/-]\d{2,4}"      # 02/09/2025 or 02-09-2025
+        r"|\d{4}[/-]\d{2}[/-]\d{2}"       # 2025/09/02
+        r"|\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[ -]\d{1,2}[, ]*\d{4}\b"  # Sep 2, 2025
+    )
     amount_regex = r"-?\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?"
 
     for row in rows:
@@ -62,6 +66,8 @@ def parse_pdf_smart(file_bytes):
 
     df = pd.DataFrame(data, columns=["Date", "Description", "Amount"])
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce", dayfirst=True)
+    # Remove rows where Date could not be parsed
+    df = df.dropna(subset=["Date"]).reset_index(drop=True)
     return df
 
 # -------------------------
@@ -121,25 +127,25 @@ if uploaded_file:
             col_mapping[c] = "Description"
         elif "amount" in c or "value" in c or "debit" in c or "credit" in c:
             col_mapping[c] = "Amount"
-
     df.rename(columns=col_mapping, inplace=True)
+
+    # -------------------------
+    # Combine Debit/Credit columns if present
+    # -------------------------
+    if "debit" in df.columns and "credit" in df.columns:
+        df["Amount"] = df["credit"].fillna(0) - df["debit"].fillna(0)
+        df = df.drop(columns=["debit", "credit"], errors="ignore")
 
     # -------------------------
     # Clean duplicate / empty columns
     # -------------------------
-    df = df.dropna(axis=1, how='all')          # remove empty columns
-    df = df.loc[:, ~df.columns.duplicated()]   # remove duplicate columns
-    df.columns = df.columns.str.strip()        # trim spaces
+    df = df.dropna(axis=1, how='all')
+    df = df.loc[:, ~df.columns.duplicated()]
+    df.columns = df.columns.str.strip()
 
     if "Date" not in df.columns:
         st.error("No valid 'Date' column detected. Please check your PDF/CSV.")
         st.stop()
-
-    if df["Date"].isnull().all():
-        st.error("All dates could not be parsed. Check your PDF or use CSV/Excel instead.")
-        st.stop()
-    if df["Date"].isnull().any():
-        st.warning(f"{df['Date'].isnull().sum()} rows could not be parsed into dates and will be ignored.")
 
     # -------------------------
     # Categorization
