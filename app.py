@@ -23,17 +23,50 @@ You'll get transactions, Income Statement, Balance Sheet, Ratios, charts, PDF & 
 """)
 
 # -------------------------
+# Bank-specific rules
+# -------------------------
+bank_rules = {
+    "FNB": {
+        "date_format": "%d/%m/%Y",
+        "debit_col": "Debit",
+        "credit_col": "Credit",
+        "balance_col": "Balance",
+        "description_keywords": ["POS", "EFT", "ATM"],
+    },
+    "Standard Bank": {
+        "date_format": "%Y-%m-%d",
+        "debit_col": "Debit Amount",
+        "credit_col": "Credit Amount",
+        "balance_col": "Running Balance",
+        "description_keywords": ["Card Payment", "Deposit"],
+    },
+    # Add more banks here
+}
+
+def detect_bank(pdf_text):
+    pdf_text = pdf_text.lower()
+    if "first national bank" in pdf_text or "fnb" in pdf_text:
+        return "FNB"
+    elif "standard bank" in pdf_text:
+        return "Standard Bank"
+    # Add more banks
+    return None
+
+# -------------------------
 # Smart PDF/OCR parser
 # -------------------------
 def parse_pdf_smart(file_bytes):
     rows = []
+    text_for_bank = ""
 
     # --- Try text extraction with pdfplumber ---
     try:
         with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-            for page in pdf.pages:
+            for i, page in enumerate(pdf.pages):
                 text = page.extract_text()
                 if text:
+                    if i == 0:
+                        text_for_bank += text  # first page for bank detection
                     for line in text.split("\n"):
                         rows.append(line)
     except:
@@ -44,7 +77,13 @@ def parse_pdf_smart(file_bytes):
         images = convert_from_bytes(file_bytes)
         for image in images:
             text = pytesseract.image_to_string(image)
+            if images.index(image) == 0:
+                text_for_bank += text
             rows.extend(text.split("\n"))
+
+    # --- Detect bank ---
+    bank_name = detect_bank(text_for_bank)
+    rules = bank_rules.get(bank_name, {})
 
     # --- Extract columns ---
     data = []
@@ -65,10 +104,23 @@ def parse_pdf_smart(file_bytes):
             data.append([date_val, desc, amount_val])
 
     df = pd.DataFrame(data, columns=["Date", "Description", "Amount"])
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce", dayfirst=True)
-    # Remove rows where Date could not be parsed
+
+    # --- Apply bank-specific date format if available ---
+    if "date_format" in rules:
+        df["Date"] = pd.to_datetime(df["Date"], format=rules["date_format"], errors="coerce")
+    else:
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce", dayfirst=True)
+
+    # --- Remove rows with unparsed dates ---
     df = df.dropna(subset=["Date"]).reset_index(drop=True)
-    return df
+
+    # --- Apply bank-specific debit/credit if present ---
+    if "debit_col" in rules and "credit_col" in rules:
+        if rules["debit_col"] in df.columns and rules["credit_col"] in df.columns:
+            df["Amount"] = df[rules["credit_col"]].fillna(0) - df[rules["debit_col"]].fillna(0)
+            df.drop(columns=[rules["debit_col"], rules["credit_col"]], inplace=True)
+
+    return df, bank_name
 
 # -------------------------
 # File upload
@@ -87,15 +139,17 @@ if uploaded_file:
             encoding = result['encoding']
             uploaded_file.seek(0)
             df = pd.read_csv(uploaded_file, encoding=encoding)
+            bank_name = None
 
         # ---- Excel ----
         elif uploaded_file.name.endswith((".xls", ".xlsx")):
             df = pd.read_excel(uploaded_file)
+            bank_name = None
 
         # ---- PDF ----
         elif uploaded_file.name.endswith(".pdf"):
             uploaded_file.seek(0)
-            df = parse_pdf_smart(uploaded_file.read())
+            df, bank_name = parse_pdf_smart(uploaded_file.read())
             if df.empty:
                 st.error("Could not parse any transactions from this PDF. Try exporting CSV/Excel instead.")
                 st.stop()
@@ -130,13 +184,6 @@ if uploaded_file:
     df.rename(columns=col_mapping, inplace=True)
 
     # -------------------------
-    # Combine Debit/Credit columns if present
-    # -------------------------
-    if "debit" in df.columns and "credit" in df.columns:
-        df["Amount"] = df["credit"].fillna(0) - df["debit"].fillna(0)
-        df = df.drop(columns=["debit", "credit"], errors="ignore")
-
-    # -------------------------
     # Clean duplicate / empty columns
     # -------------------------
     df = df.dropna(axis=1, how='all')
@@ -167,7 +214,7 @@ if uploaded_file:
     df["Amount"] = pd.to_numeric(df["Amount"], errors="coerce")
     df["Category"] = df.apply(lambda row: categorize(row["Description"], row["Amount"]), axis=1)
 
-    st.subheader("📑 Transactions")
+    st.subheader(f"📑 Transactions {'(Bank: ' + bank_name + ')' if bank_name else ''}")
     st.dataframe(df, use_container_width=True)
 
     # -------------------------
@@ -261,11 +308,4 @@ if uploaded_file:
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Transactions")
         pd.DataFrame({
-            "Metric": ["Revenue", "Expenses", "Net Profit", "Assets", "Liabilities", "Equity",
-                       "DCF EV", "EV/EBITDA EV", "Revenue Multiple EV"],
-            "Value": [income, expenses, net_profit, total_assets, total_liabilities, equity,
-                      dcf_ev, ev_ebitda, ev_revenue]
-        }).to_excel(writer, index=False, sheet_name="Statements")
-    st.download_button("📥 Download Excel", data=output.getvalue(),
-                       file_name="financials.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            "Metric": ["Revenue", "Expenses", "Net Profit", "Assets", "Liabilities", "Equ
